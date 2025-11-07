@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { executeRead, executeWrite } = require('../config/database');
+const { executeCentralRead, executeCentralWrite, executeDomainWrite, createDomainSchema } = require('../config/database');
 const {
   getClientIP,
   getIPLocation,
@@ -167,11 +167,11 @@ router.get('/hit.php', async (req, res) => {
       return res.json({ error: 'Advertiser ID invalid: ' + advertiser });
     }
 
-    // Check if advertiser exists and license matches
+    // Check if advertiser exists and license matches (from central database)
     const advertiserQuery = `
       SELECT * FROM advertiser WHERE aid = ?
     `;
-    const advertiserResult = await executeRead(advertiserQuery, [parseInt(advertiser)]);
+    const advertiserResult = await executeCentralRead(advertiserQuery, [parseInt(advertiser)]);
 
     if (advertiserResult.length === 0) {
       return res.json({ error: 'Advertiser not found: ' + advertiser });
@@ -182,59 +182,56 @@ router.get('/hit.php', async (req, res) => {
       return res.json({ error: 'Invalid license for advertiser: ' + advertiser });
     }
 
-    // Check if domain exists or create it
+    // Get db_host from advertiser (for domain-specific database connection)
+    const dbHost = advertiserData.db_host || process.env.DB_HOST;
+
+    // Check if domain exists or create it (from central database)
     let domainQuery = `SELECT * FROM domain WHERE name = ?`;
-    let domainResult = await executeRead(domainQuery, [hitOffer]);
+    let domainResult = await executeCentralRead(domainQuery, [hitOffer]);
 
     let domainKey = 0;
     if (domainResult.length === 0) {
-      // Create new domain
+      // Create new domain in central database
       const insertDomain = `
         INSERT INTO domain (name, aid, date_created)
         VALUES (?, ?, NOW())
       `;
-      const insertResult = await executeWrite(insertDomain, [hitOffer, parseInt(advertiser)]);
+      const insertResult = await executeCentralWrite(insertDomain, [hitOffer, parseInt(advertiser)]);
       domainKey = insertResult.insertId;
     } else {
       domainKey = domainResult[0].dkey;
     }
 
+    // Create domain-specific database schema if it doesn't exist
+    await createDomainSchema(domainKey);
+
     // Generate pkey if not provided
     let pkeyValue = pkey ? parseInt(pkey) : 0;
 
     if (pkeyValue === 0) {
-      // Insert new hit record
-      const insertHit = `
-        INSERT INTO hit (
-          dkey, ip, channel, subchannel, target, referer, raw_target,
-          browser, browser_version, os, os_version, device,
-          is_mobile, is_smartphone, is_tablet, is_bot,
-          country, state, city, postcode, isp, org,
-          languages, screen_width, screen_height, screen_depth,
-          timezone_offset, variant, is_engagement,
-          sem_gclid, sem_bclid, sem_msclkid, sem_fbclid,
-          sem_audience, sem_position, log_string, dnt,
-          timestamp
+      // Insert new visit record into domain-specific database (lazysauce_{dkey}.visit)
+      // Note: Using 'visit' table and 'did' field (not 'hit' table and 'dkey')
+      const insertVisit = `
+        INSERT INTO visit (
+          did, ip, variant, channel, subchannel, target,
+          is_bot, engagement, date_created
         ) VALUES (
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, NOW()
+          ?, INET6_ATON(?), ?, ?, ?, ?, ?, ?, NOW()
         )
       `;
 
-      const hitResult = await executeWrite(insertHit, [
-        domainKey, ip, channel, subchannel, keyword, referer, rawkw,
-        uaInfo.browser, uaInfo.browser_version, uaInfo.os, uaInfo.os_version, uaInfo.device,
-        uaInfo.is_mobile ? 1 : 0, uaInfo.is_smartphone ? 1 : 0, uaInfo.is_tablet ? 1 : 0, isBot,
-        ipLocation.country_code, ipLocation.state, ipLocation.city, ipLocation.postcode,
-        ipLocation.isp, ipLocation.org,
-        languages, screenWidth, screenHeight, screenDepth,
-        timezone, variant, isEngagement,
-        sem_gclid, sem_bclid, sem_msclkid, sem_fbclid,
-        sem_audience, sem_position, logString, dnt
-      ]);
+      const visitResult = await executeDomainWrite(domainKey, insertVisit, [
+        domainKey,
+        ip,
+        variant,
+        channel,
+        subchannel,
+        keyword,
+        isBot,
+        isEngagement
+      ], dbHost);
 
-      pkeyValue = hitResult.insertId;
+      pkeyValue = visitResult.insertId;
     }
 
     // Generate hash

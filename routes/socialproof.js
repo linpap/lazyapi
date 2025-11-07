@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { executeRead } = require('../config/database');
+const { executeCentralRead, executeDomainRead } = require('../config/database');
 const { getParam, sendJSONP } = require('../utils/helpers');
 
 /**
@@ -12,42 +12,59 @@ router.get('/socialproof.php', async (req, res) => {
     const callback = getParam(req, 'response', null);
 
     // Get parameters
+    const domainName = getParam(req, 'd', '');
     const trigger = getParam(req, 't', 'buy_click');
     const minRevenue = parseFloat(getParam(req, 'mr', '0'));
     const intervalHours = parseInt(getParam(req, 'i', '24'));
     const resultCount = parseInt(getParam(req, 'r', '10'));
 
-    // Query recent sales for social proof
+    if (!domainName) {
+      return res.json({ error: 'Missing domain parameter' });
+    }
+
+    // Get domain info from central database
+    const domainQuery = `SELECT dkey, aid FROM domain WHERE name = ?`;
+    const domainResult = await executeCentralRead(domainQuery, [domainName]);
+
+    if (domainResult.length === 0) {
+      return res.json({ error: 'Domain not found' });
+    }
+
+    const dkey = domainResult[0].dkey;
+
+    // Get advertiser info for db_host
+    const advertiserQuery = `SELECT db_host FROM advertiser WHERE aid = ?`;
+    const advertiserResult = await executeCentralRead(advertiserQuery, [domainResult[0].aid]);
+    const dbHost = advertiserResult.length > 0 ? advertiserResult[0].db_host : process.env.DB_HOST;
+
+    // Query recent actions with revenue from domain-specific database
+    // Note: In domain DB, there's no separate 'sale' table - revenue is in action table
     const query = `
       SELECT
-        sale.revenue,
-        sale.timestamp,
-        hit.city,
-        hit.state,
-        hit.country
-      FROM sale
-      INNER JOIN action ON sale.hash = action.hash
-      INNER JOIN hit ON action.pkey = hit.pkey
+        action.revenue,
+        action.date_created as timestamp,
+        action.name
+      FROM action
       WHERE
-        sale.revenue >= ?
-        AND sale.timestamp >= DATE_SUB(NOW(), INTERVAL ? HOUR)
-        AND action.action_offer LIKE ?
-      ORDER BY sale.timestamp DESC
+        action.revenue >= ?
+        AND action.date_created >= DATE_SUB(NOW(), INTERVAL ? HOUR)
+        AND action.name LIKE ?
+      ORDER BY action.date_created DESC
       LIMIT ?
     `;
 
-    const results = await executeRead(query, [
+    const results = await executeDomainRead(dkey, query, [
       minRevenue,
       intervalHours,
       `%${trigger}%`,
       resultCount
-    ]);
+    ], dbHost);
 
     // Format results
     const proofs = results.map(row => ({
       revenue: parseFloat(row.revenue),
       time_ago: calculateTimeAgo(row.timestamp),
-      location: formatLocation(row.city, row.state, row.country)
+      action: row.name
     }));
 
     const result = {
@@ -81,17 +98,6 @@ function calculateTimeAgo(timestamp) {
 
   const diffDays = Math.floor(diffHours / 24);
   return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
-}
-
-/**
- * Format location string
- */
-function formatLocation(city, state, country) {
-  const parts = [];
-  if (city) parts.push(city);
-  if (state) parts.push(state);
-  if (country) parts.push(country);
-  return parts.join(', ') || 'Unknown';
 }
 
 module.exports = router;

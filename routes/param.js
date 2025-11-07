@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { executeWrite } = require('../config/database');
+const { executeCentralRead, executeDomainWrite } = require('../config/database');
 const { getParam, removeChecksum, sendJSONP } = require('../utils/helpers');
 
 /**
@@ -13,31 +13,56 @@ router.get('/param.php', async (req, res) => {
 
     // Get parameters
     const pkey = removeChecksum(getParam(req, 'p', '0'));
-    const hash = getParam(req, 'h', '0');
+    const hashIn = getParam(req, 'h', '0');
     const action = parseInt(getParam(req, 'action', '0'));
     const paramName = getParam(req, 'pn', '');
     const paramValue = getParam(req, 'pv', '');
 
-    if (pkey === 0 || !paramName) {
+    if ((pkey === 0 && !hashIn) || !paramName) {
       return res.json({ error: 'Missing required parameters' });
     }
 
-    // Determine which ID to use (pkey or hash)
-    const idType = action === 1 ? 'hash' : 'pkey';
-    const idValue = action === 1 ? hash : pkey;
+    // Parse hash to get domain key (format: dkey_pkey_actionhash)
+    let dkey = 0;
+    let hashValue = 0;
 
-    // Insert parameter record
+    if (hashIn && hashIn !== '0') {
+      const hashParts = hashIn.split('_');
+      if (hashParts.length >= 2) {
+        dkey = parseInt(hashParts[0]);
+        hashValue = hashParts.length >= 3 ? parseInt(hashParts[2]) : 0;
+      }
+    }
+
+    if (!dkey) {
+      return res.json({ error: 'Invalid hash format' });
+    }
+
+    // Get domain info from central database to get db_host
+    const domainQuery = `SELECT * FROM domain WHERE dkey = ?`;
+    const domainResult = await executeCentralRead(domainQuery, [dkey]);
+
+    if (domainResult.length === 0) {
+      return res.json({ error: 'Domain not found' });
+    }
+
+    // Get advertiser info for db_host
+    const advertiserQuery = `SELECT db_host FROM advertiser WHERE aid = ?`;
+    const advertiserResult = await executeCentralRead(advertiserQuery, [domainResult[0].aid]);
+    const dbHost = advertiserResult.length > 0 ? advertiserResult[0].db_host : process.env.DB_HOST;
+
+    // Insert parameter into domain-specific database (lazysauce_{dkey}.parameters)
     const insertParam = `
-      INSERT INTO param (
-        ${idType}, param_name, param_value, timestamp
-      ) VALUES (?, ?, ?, NOW())
+      INSERT INTO parameters (
+        pkey, hash, name, value, date_created
+      ) VALUES (?, ?, ?, ?, NOW())
     `;
 
-    await executeWrite(insertParam, [idValue, paramName, paramValue]);
+    await executeDomainWrite(dkey, insertParam, [pkey, hashValue, paramName, paramValue], dbHost);
 
     const result = {
       pkey: pkey,
-      hash: hash,
+      hash: hashIn,
       param_name: paramName,
       param_value: paramValue,
       status: 'success'
