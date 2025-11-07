@@ -11,45 +11,67 @@ router.get('/param.php', async (req, res) => {
   try {
     const callback = getParam(req, 'response', null);
 
-    // Get parameters
+    // Get parameters (matching PHP structure)
     const pkey = removeChecksum(getParam(req, 'p', '0'));
+    const advertiser = getParam(req, 'a', '');
+    const license = getParam(req, 'l', '');
+    const lazyUrl = getParam(req, 'lazy_url', '');
     const hashIn = getParam(req, 'h', '0');
-    const action = parseInt(getParam(req, 'action', '0'));
     const paramName = getParam(req, 'pn', '');
     const paramValue = getParam(req, 'pv', '');
 
-    if ((pkey === 0 && !hashIn) || !paramName) {
+    if (pkey === 0 || !paramName) {
       return res.json({ error: 'Missing required parameters' });
     }
 
-    // Parse hash to get domain key (format: dkey_pkey_actionhash)
-    let dkey = 0;
-    let hashValue = 0;
-
-    if (hashIn && hashIn !== '0') {
-      const hashParts = hashIn.split('_');
-      if (hashParts.length >= 2) {
-        dkey = parseInt(hashParts[0]);
-        hashValue = hashParts.length >= 3 ? parseInt(hashParts[2]) : 0;
+    // Get domain from lazy_url
+    let hitOffer = '';
+    if (lazyUrl) {
+      try {
+        const urlObj = new URL(lazyUrl);
+        hitOffer = urlObj.hostname.replace('www.', '');
+      } catch (e) {
+        hitOffer = 'unknown';
       }
     }
 
-    if (!dkey) {
-      return res.json({ error: 'Invalid hash format' });
+    if (!hitOffer) {
+      return res.json({ error: 'Missing lazy_url parameter' });
     }
 
-    // Get domain info from central database to get db_host
-    const domainQuery = `SELECT * FROM domain WHERE dkey = ?`;
-    const domainResult = await executeCentralRead(domainQuery, [dkey]);
+    // Verify advertiser and license from central database
+    if (advertiser && license) {
+      const advertiserQuery = `SELECT * FROM advertiser WHERE aid = ?`;
+      const advertiserResult = await executeCentralRead(advertiserQuery, [parseInt(advertiser)]);
+
+      if (advertiserResult.length === 0 || advertiserResult[0].license !== license) {
+        return res.json({ error: 'Invalid advertiser or license' });
+      }
+    }
+
+    // Get domain info from central database
+    const domainQuery = `SELECT dkey, aid FROM domain WHERE name = ?`;
+    const domainResult = await executeCentralRead(domainQuery, [hitOffer]);
 
     if (domainResult.length === 0) {
       return res.json({ error: 'Domain not found' });
     }
 
+    const dkey = domainResult[0].dkey;
+
     // Get advertiser info for db_host
-    const advertiserQuery = `SELECT db_host FROM advertiser WHERE aid = ?`;
-    const advertiserResult = await executeCentralRead(advertiserQuery, [domainResult[0].aid]);
-    const dbHost = advertiserResult.length > 0 ? advertiserResult[0].db_host : process.env.DB_HOST;
+    const advertiserQuery2 = `SELECT db_host FROM advertiser WHERE aid = ?`;
+    const advertiserResult2 = await executeCentralRead(advertiserQuery2, [domainResult[0].aid]);
+    const dbHost = advertiserResult2.length > 0 ? advertiserResult2[0].db_host : process.env.DB_HOST;
+
+    // Parse hash value if provided (format: dkey_pkey_actionhash)
+    let hashValue = 0;
+    if (hashIn && hashIn !== '0') {
+      const hashParts = hashIn.split('_');
+      if (hashParts.length >= 3) {
+        hashValue = parseInt(hashParts[2]);
+      }
+    }
 
     // Insert parameter into domain-specific database (lazysauce_{dkey}.parameters)
     const insertParam = `
